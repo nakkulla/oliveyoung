@@ -1,5 +1,7 @@
 import time
 import os
+import shutil
+import tempfile
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +13,8 @@ import json
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from base_crawler import BaseCrawler
 
 
@@ -242,6 +246,10 @@ class OliveYoungCrawler(BaseCrawler):
         if config:
             default_config.update(config)
         
+        # Setup temporary profile directory before parent init
+        self.temp_profile_dir = None
+        self._setup_temp_profile()
+        
         super().__init__(
             name="OliveYoungCrawler",
             headless=headless,
@@ -281,13 +289,123 @@ class OliveYoungCrawler(BaseCrawler):
             }
             options.add_experimental_option("mobileEmulation", mobile_emulation)
         
+        # Add options for clean sessions and cache clearing
+        options.add_argument('--no-first-run')
+        options.add_argument('--no-default-browser-check')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--disable-background-timer-throttling')
+        options.add_argument('--disable-renderer-backgrounding')
+        options.add_argument('--disable-backgrounding-occluded-windows')
+        options.add_argument('--disable-client-side-phishing-detection')
+        options.add_argument('--disable-sync')
+        options.add_argument('--disable-translate')
+        options.add_argument('--hide-scrollbars')
+        options.add_argument('--mute-audio')
+        
+        # Use temporary profile directory
+        if self.temp_profile_dir:
+            options.add_argument(f'--user-data-dir={self.temp_profile_dir}')
+        
+        # Force no cache persistence
+        options.add_argument('--aggressive-cache-discard')
+        options.add_argument('--disable-background-networking')
+        options.add_argument('--disable-component-update')
+        
         return options
+    
+    def _setup_temp_profile(self):
+        """Setup temporary profile directory for clean browser sessions"""
+        try:
+            self.temp_profile_dir = tempfile.mkdtemp(prefix='chrome_profile_')
+            # Logger might not be initialized yet, so use print for now
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.info(f"Created temporary profile directory: {self.temp_profile_dir}")
+            else:
+                print(f"Created temporary profile directory: {self.temp_profile_dir}")
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"Failed to create temp profile directory: {e}")
+            else:
+                print(f"Failed to create temp profile directory: {e}")
+            self.temp_profile_dir = None
     
     def _setup_mobile_emulation(self):
         """Setup mobile emulation settings"""
         if self.use_mobile and self.driver:
             self.driver.set_window_size(375, 812)
             self.logger.info("Mobile emulation enabled")
+    
+    def restart_browser(self, reason: str = "general"):
+        """
+        Completely restart the browser with fresh profile and cleared cache/cookies
+        
+        Args:
+            reason: Reason for restart (for logging purposes)
+        """
+        self.logger.info(f"Restarting browser - Reason: {reason}")
+        
+        try:
+            # Close current browser if exists
+            if self.driver:
+                self.driver.quit()
+                self.logger.info("Previous browser session closed")
+            
+            # Clear temporary profile directory
+            if self.temp_profile_dir and os.path.exists(self.temp_profile_dir):
+                try:
+                    shutil.rmtree(self.temp_profile_dir)
+                    self.logger.info("Cleared temporary profile directory")
+                except Exception as e:
+                    self.logger.warning(f"Failed to clear temp profile: {e}")
+            
+            # Create new temporary profile directory
+            self._setup_temp_profile()
+            
+            # Wait a moment for system cleanup
+            time.sleep(2)
+            
+            # Initialize new browser with fresh profile
+            options = self._get_chrome_options()
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+            self.wait = self.driver.wait if hasattr(self.driver, 'wait') else None
+            
+            # Re-inject stealth scripts
+            self._inject_stealth_scripts()
+            
+            # Apply mobile settings if needed
+            if self.use_mobile:
+                self._setup_mobile_emulation()
+            
+            self.logger.info("Browser restarted successfully with clean profile")
+            
+            # Additional wait for browser initialization
+            time.sleep(3)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to restart browser: {e}")
+            raise
+    
+    def _inject_stealth_scripts(self):
+        """Inject stealth scripts to avoid detection (override from base class)"""
+        try:
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {get: () => false});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'permissions', {
+                        get: () => ({
+                            query: (p) => p.name === 'notifications' ? 
+                                Promise.resolve({ state: 'prompt' }) : 
+                                Promise.resolve({ state: 'granted' })
+                        })
+                    });
+                '''
+            })
+            self.logger.debug("Stealth scripts injected successfully")
+        except Exception as e:
+            self.logger.warning(f"Could not inject stealth scripts: {e}")
     
     def _wait_for_page_complete_load(self, timeout: int = 30):
         """Wait for page and all images to be completely loaded"""
@@ -428,6 +546,67 @@ class OliveYoungCrawler(BaseCrawler):
                 self.logger.error(f"No screenshots captured for {category.display_name}")
                 return None
             
+            # Validate screenshot count - if too low, likely page didn't load properly
+            MIN_EXPECTED_SCREENSHOTS = 20
+            if len(screenshots) < MIN_EXPECTED_SCREENSHOTS:
+                self.logger.warning(
+                    f"Low screenshot count detected: {len(screenshots)} (expected >= {MIN_EXPECTED_SCREENSHOTS}). "
+                    f"Page may not have loaded properly for {category.display_name}"
+                )
+                
+                # Try restarting browser and recapturing once
+                try:
+                    self.logger.info(f"Restarting browser due to low screenshot count for {category.display_name}")
+                    self.restart_browser(f"low screenshot count for {category.name}")
+                    
+                    # Navigate again and wait for load
+                    url = category.url
+                    self.logger.info(f"Re-navigating to: {url}")
+                    self.driver.get(url)
+                    time.sleep(3)
+                    
+                    # Handle blocking page again
+                    max_wait_attempts = 5
+                    for attempt in range(max_wait_attempts):
+                        if "잠시만 기다리십시오" in self.driver.title:
+                            self.logger.warning(f"Detected blocking page on retry, attempt {attempt + 1}/{max_wait_attempts}")
+                            time.sleep(10)
+                            self.driver.refresh()
+                            time.sleep(5)
+                        else:
+                            break
+                    
+                    # Wait for complete load again
+                    self._wait_for_page_complete_load()
+                    time.sleep(3)
+                    
+                    # Capture screenshots again
+                    retry_screenshots = self.screenshot_manager.capture_scrolling_screenshots(
+                        self.driver,
+                        self.RANKING_CONTAINER_XPATH,
+                        f"{category.name}_realtime_retry",
+                        max_scrolls=50,
+                        scroll_pause=1.5
+                    )
+                    
+                    if retry_screenshots and len(retry_screenshots) >= MIN_EXPECTED_SCREENSHOTS:
+                        self.logger.info(f"Retry successful: captured {len(retry_screenshots)} screenshots")
+                        screenshots = retry_screenshots
+                    elif retry_screenshots:
+                        self.logger.warning(
+                            f"Retry still resulted in low count: {len(retry_screenshots)} screenshots. "
+                            f"Proceeding with available screenshots."
+                        )
+                        screenshots = retry_screenshots
+                    else:
+                        self.logger.error(f"Retry failed - no screenshots captured on second attempt")
+                        
+                except Exception as retry_e:
+                    self.logger.error(f"Failed to restart browser and retry: {retry_e}")
+                    # Continue with original screenshots if retry fails
+            
+            self.logger.info(f"Final screenshot count for {category.display_name}: {len(screenshots)}")
+            
             # Merge screenshots
             output_name = f"{category.name}_realtime_ranking"
             merged_path = self.screenshot_manager.merge_screenshots(
@@ -456,6 +635,10 @@ class OliveYoungCrawler(BaseCrawler):
         for i, category in enumerate(target_categories, 1):
             self.logger.info(f"Processing {i}/{total}: {category.display_name}")
             
+            # Restart browser between categories for fresh session
+            if i > 1:  # Don't restart before first category
+                self.restart_browser(f"switching to category {category.name}")
+            
             try:
                 result = self.capture_category_ranking(category, period)
                 if result:
@@ -466,12 +649,24 @@ class OliveYoungCrawler(BaseCrawler):
             
             except Exception as e:
                 self.logger.error(f"Error processing {category.display_name}: {e}")
+                # Try restarting browser and retrying once on error
+                try:
+                    self.logger.info(f"Retrying {category.display_name} with fresh browser session")
+                    self.restart_browser(f"error retry for {category.name}")
+                    result = self.capture_category_ranking(category, period)
+                    if result:
+                        results[category.name] = result
+                        self.logger.info(f"Successfully captured {category.display_name} on retry")
+                    else:
+                        self.logger.warning(f"Failed to capture {category.display_name} on retry")
+                except Exception as retry_e:
+                    self.logger.error(f"Retry also failed for {category.display_name}: {retry_e}")
                 continue
             
-            # Add delay between categories to avoid blocking
+            # Add delay between categories (reduced since we're restarting browser)
             if i < total:
-                self.logger.info("Waiting before next category...")
-                time.sleep(10)
+                self.logger.info("Brief pause before next category...")
+                time.sleep(5)
         
         # Save results summary
         summary_file = self.data_dir / f"capture_summary_{self.session_id}.json"
@@ -519,6 +714,21 @@ class OliveYoungCrawler(BaseCrawler):
         
         finally:
             self.cleanup()
+    
+    def cleanup(self):
+        """Override cleanup to also remove temporary profile directory"""
+        # Call parent cleanup first
+        super().cleanup()
+        
+        # Clean up temporary profile directory
+        if self.temp_profile_dir and os.path.exists(self.temp_profile_dir):
+            try:
+                shutil.rmtree(self.temp_profile_dir)
+                self.logger.info(f"Cleaned up temporary profile directory: {self.temp_profile_dir}")
+            except Exception as e:
+                self.logger.warning(f"Failed to clean up temp profile directory: {e}")
+        
+        self.logger.info("OliveYoungCrawler cleanup completed")
 
 
 def main():
