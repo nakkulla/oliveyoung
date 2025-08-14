@@ -11,10 +11,10 @@ def main():
     print("=" * 60)
     
     # Test with multiple categories
-    test_categories = ["all", "skincare", "makeup"]
+    test_categories = ["all", "bodycare"]
     
     crawler = OliveYoungCrawler(
-        headless=False,
+        headless=True,
         use_mobile=True,
         config={
             'base_dir': '/Users/isy_mac_mini/Project/personal/oliveyoung/Data/multi_test',

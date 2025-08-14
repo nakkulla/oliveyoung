@@ -1,0 +1,7 @@
+selenium==4.34.2
+webdriver-manager==4.0.2
+Pillow==11.3.0
+fake-useragent==2.2.0
+requests==2.32.4
+urllib3==2.5.0
+certifi>=2025.6.15

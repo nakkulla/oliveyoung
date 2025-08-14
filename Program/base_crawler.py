@@ -7,13 +7,13 @@ from pathlib import Path
 from contextlib import contextmanager
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 import functools
-import undetected_chromedriver as uc
-from selenium_stealth import stealth
 from fake_useragent import UserAgent
 import random
 
@@ -98,40 +98,31 @@ class BaseCrawler:
         return logger
     
     def _init_driver(self):
-        """Initialize Chrome driver with anti-detection measures"""
+        """Initialize Chrome driver with automatic driver management"""
         try:
             options = self._get_chrome_options()
             
-            # Use undetected-chromedriver
-            self.driver = uc.Chrome(options=options, headless=self.headless)
+            # Use webdriver-manager to automatically download and manage ChromeDriver
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
             self.wait = WebDriverWait(self.driver, self.config.get('wait_timeout', 20))
             
-            # Apply stealth techniques
-            stealth(self.driver,
-                    languages=["ko-KR", "ko", "en-US", "en"],
-                    vendor="Google Inc.",
-                    platform="Linux armv8l" if self.config.get('use_mobile') else "Win32",
-                    webgl_vendor="ARM" if self.config.get('use_mobile') else "Intel Inc.",
-                    renderer="Mali-G78" if self.config.get('use_mobile') else "Intel Iris OpenGL Engine",
-                    fix_hairline=True,
-                    )
-            
-            # Inject additional anti-detection JavaScript
+            # Inject anti-detection JavaScript
             self._inject_stealth_scripts()
             
-            self.logger.info("Chrome driver initialized with anti-detection")
+            self.logger.info("Chrome driver initialized successfully")
         except Exception as e:
             self.logger.error(f"Failed to initialize Chrome driver: {e}")
             raise
     
     def _get_chrome_options(self) -> Options:
         """Get Chrome options with anti-detection settings"""
-        options = uc.ChromeOptions()
+        options = Options()
         
         # Enhanced anti-detection
         options.add_argument('--disable-blink-features=AutomationControlled')
-        # options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-        # options.add_experimental_option('useAutomationExtension', False)
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        options.add_experimental_option('useAutomationExtension', False)
         
         # Language settings for Korean sites
         options.add_argument('--lang=ko-KR')
